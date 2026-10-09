@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Compare regular and cache-bypassed website responses to verify CDN freshness.">
+    <title>Cache Verifier</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">CV</span>
+        <div>
+          <div class="eyebrow">CDN diagnostics</div>
+          <h1>Cache Verifier</h1>
+        </div>
+      </div>
+      <span class="status-chip"><span class="status-dot"></span>Server-side checks</span>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div>
+          <p class="eyebrow accent">Compare what visitors receive</p>
+          <h2>Is your CDN serving the newest content?</h2>
+          <p class="hero-copy">
+            Check pages and discovered assets from the server, inspect cache headers, and compare a normal response
+            with a cache-bypassed probe. Add an expected text marker for the strongest freshness result.
+          </p>
+        </div>
+        <div class="method-card">
+          <span>How it works</span>
+          <ol>
+            <li>Request the public URL normally.</li>
+            <li>Request it again with a unique query and no-cache headers.</li>
+            <li>Compare content hashes, markers, cache state, age, and TTL.</li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <form id="check-form" class="panel config-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">Configuration</p>
+              <h3>Targets</h3>
+            </div>
+            <button type="button" id="sample-button" class="button secondary">Load example</button>
+          </div>
+
+          <label for="base-url">Base website URL <span class="optional">Optional for full URLs</span></label>
+          <input id="base-url" name="baseUrl" type="url" placeholder="https://example.com">
+          <p class="field-help">Required only when you enter paths such as <code>/pricing</code>.</p>
+
+          <div class="label-row">
+            <label for="target-list">Page paths or full URLs</label>
+            <span id="target-count">0 / 20</span>
+          </div>
+          <textarea id="target-list" name="targets" rows="8" required placeholder="/&#10;/about || Released October 2026&#10;https://cdn.example.com/app.css"></textarea>
+          <p class="field-help">
+            One target per line. Optionally add <code>|| expected newest text</code> to verify a deployment marker.
+          </p>
+
+          <label for="expected-edge">Expected CDN / edge identifier <span class="optional">Optional</span></label>
+          <input id="expected-edge" name="expectedEdge" type="text" maxlength="100" placeholder="cloudflare, cloudfront, varnish">
+          <p class="field-help">Matched against Via, Server, X-Cache, CF-Ray, and X-Served-By.</p>
+
+          <label class="toggle-row" for="discover-assets">
+            <input id="discover-assets" name="discoverAssets" type="checkbox" checked>
+            <span>
+              <strong>Discover page assets</strong>
+              <small>Also inspect up to 10 CSS, JavaScript, font, and image URLs found in the HTML.</small>
+            </span>
+          </label>
+
+          <button id="run-button" class="button primary" type="submit">
+            <span class="button-icon" aria-hidden="true">▶</span>
+            <span>Run verification</span>
+          </button>
+          <p class="privacy-note">Only public HTTP(S) targets are allowed. Private and local network addresses are blocked.</p>
+        </form>
+
+        <div class="results-column">
+          <section class="stats" aria-label="Verification summary">
+            <article><span>Checked</span><strong id="stat-total">0</strong></article>
+            <article class="good"><span>Current / consistent</span><strong id="stat-good">0</strong></article>
+            <article class="warn"><span>Needs review</span><strong id="stat-review">0</strong></article>
+            <article class="bad"><span>Errors</span><strong id="stat-error">0</strong></article>
+          </section>
+
+          <section class="panel results-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">Results</p>
+                <h3>Response comparison</h3>
+                <p id="run-summary" class="muted">No verification has run yet.</p>
+              </div>
+              <button type="button" id="export-button" class="button secondary" disabled>Export CSV</button>
+            </div>
+            <div id="notice" class="notice hidden" role="status"></div>
+            <div id="empty-state" class="empty-state">
+              <span aria-hidden="true">◎</span>
+              <strong>Ready to inspect</strong>
+              <p>Enter one or more public pages, then run the verification.</p>
+            </div>
+            <div id="results" class="result-list hidden" aria-live="polite"></div>
+          </section>
+
+          <section class="panel guide">
+            <div>
+              <p class="eyebrow">Interpretation</p>
+              <h3>A cache HIT does not mean stale</h3>
+            </div>
+            <div class="guide-grid">
+              <p><span class="legend current"></span><strong>Current:</strong> expected newest text exists in the normal response.</p>
+              <p><span class="legend stale"></span><strong>Stale:</strong> expected text exists only in the bypassed response.</p>
+              <p><span class="legend review"></span><strong>Review:</strong> hashes differ, the marker is absent, or headers cannot prove freshness.</p>
+              <p><span class="legend consistent"></span><strong>Consistent:</strong> both probes have the same hash, but no marker was supplied.</p>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="alert" aria-live="assertive"></div>
+  </body>
+</html>

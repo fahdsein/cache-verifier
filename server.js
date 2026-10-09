@@ -1,0 +1,530 @@
+import { createHash, randomUUID } from "node:crypto";
+import dns from "node:dns/promises";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
+import { createServer } from "node:http";
+import net from "node:net";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ROOT = path.dirname(fileURLToPath(import.meta.url));
+const PUBLIC_DIR = path.join(ROOT, "public");
+const MAX_BODY_BYTES = 64 * 1024;
+const MAX_REMOTE_BYTES = 4 * 1024 * 1024;
+const MAX_TARGETS = 20;
+const MAX_DISCOVERED_ASSETS = 10;
+const REQUEST_TIMEOUT_MS = 15_000;
+const MAX_REDIRECTS = 5;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+const RATE_LIMIT_REQUESTS = 15;
+const rateLimits = new Map();
+
+const MIME_TYPES = {
+  ".css": "text/css; charset=utf-8",
+  ".html": "text/html; charset=utf-8",
+  ".ico": "image/x-icon",
+  ".js": "text/javascript; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".svg": "image/svg+xml"
+};
+
+const OBSERVED_HEADERS = [
+  "age",
+  "cache-control",
+  "cdn-cache-control",
+  "cf-cache-status",
+  "cf-ray",
+  "etag",
+  "expires",
+  "last-modified",
+  "server",
+  "surrogate-control",
+  "via",
+  "x-cache",
+  "x-cache-hits",
+  "x-cdn",
+  "x-served-by",
+  "x-vercel-cache"
+];
+
+function sendJson(response, status, payload) {
+  const body = JSON.stringify(payload);
+  response.writeHead(status, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Content-Length": Buffer.byteLength(body),
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff"
+  });
+  response.end(body);
+}
+
+async function readJson(request) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) throw new Error("Request body is too large");
+    chunks.push(chunk);
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  } catch {
+    throw new Error("Request body must be valid JSON");
+  }
+}
+
+function parseIpv4(address) {
+  const parts = address.split(".").map(Number);
+  return parts.length === 4 && parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)
+    ? parts
+    : null;
+}
+
+export function isPrivateAddress(address) {
+  const normalized = address.toLowerCase().split("%")[0];
+  const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
+  if (mapped) return isPrivateAddress(mapped[1]);
+
+  if (net.isIPv4(normalized)) {
+    const [a, b] = parseIpv4(normalized);
+    return (
+      a === 0 ||
+      a === 10 ||
+      a === 127 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 0) ||
+      (a === 192 && b === 168) ||
+      (a === 198 && (b === 18 || b === 19)) ||
+      a >= 224
+    );
+  }
+
+  if (net.isIPv6(normalized)) {
+    return (
+      normalized === "::" ||
+      normalized === "::1" ||
+      normalized.startsWith("fc") ||
+      normalized.startsWith("fd") ||
+      /^fe[89ab]/.test(normalized)
+    );
+  }
+
+  return true;
+}
+
+export async function validateRemoteUrl(value) {
+  let url;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Invalid URL");
+  }
+  if (!["http:", "https:"].includes(url.protocol)) throw new Error("Only HTTP and HTTPS URLs are allowed");
+  if (url.username || url.password) throw new Error("URLs containing credentials are not allowed");
+  if (url.hostname.toLowerCase() === "localhost") throw new Error("Local and private network targets are not allowed");
+
+  const addresses = await dns.lookup(url.hostname, { all: true, verbatim: true });
+  if (!addresses.length || addresses.some(({ address }) => isPrivateAddress(address))) {
+    throw new Error("Local and private network targets are not allowed");
+  }
+  return url;
+}
+
+function headersToObject(headers) {
+  const output = {};
+  for (const name of OBSERVED_HEADERS) {
+    const value = headers.get(name);
+    if (value) output[name] = value;
+  }
+  return output;
+}
+
+export function classifyCache(headers) {
+  const signal = [
+    headers["cf-cache-status"],
+    headers["x-vercel-cache"],
+    headers["x-cache"],
+    headers["x-cache-hits"],
+    headers["cdn-cache-control"]
+  ].filter(Boolean).join(" ").toUpperCase();
+
+  for (const state of ["STALE", "REVALIDATED", "EXPIRED", "BYPASS", "DYNAMIC", "MISS", "HIT"]) {
+    if (signal.includes(state)) return state;
+  }
+  return Number(headers.age || 0) > 0 ? "HIT (inferred)" : "UNKNOWN";
+}
+
+export function calculateTtl(headers) {
+  const cacheControl = [headers["cdn-cache-control"], headers["cache-control"]].filter(Boolean).join(",");
+  const match = cacheControl.match(/(?:s-maxage|max-age)\s*=\s*(\d+)/i);
+  const maxAge = match ? Number(match[1]) : null;
+  const age = Number.parseInt(headers.age || "0", 10);
+  return {
+    ageSeconds: Number.isFinite(age) ? age : 0,
+    maxAgeSeconds: maxAge,
+    remainingSeconds: maxAge === null ? null : Math.max(0, maxAge - (Number.isFinite(age) ? age : 0))
+  };
+}
+
+async function readRemoteBody(response) {
+  if (!response.body) return { buffer: Buffer.alloc(0), truncated: false };
+  const reader = response.body.getReader();
+  const chunks = [];
+  let size = 0;
+  let truncated = false;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (size + value.byteLength > MAX_REMOTE_BYTES) {
+      const remaining = Math.max(0, MAX_REMOTE_BYTES - size);
+      if (remaining) chunks.push(Buffer.from(value.subarray(0, remaining)));
+      size += remaining;
+      truncated = true;
+      await reader.cancel();
+      break;
+    }
+    chunks.push(Buffer.from(value));
+    size += value.byteLength;
+  }
+  return { buffer: Buffer.concat(chunks), truncated };
+}
+
+async function fetchWithValidatedRedirects(initialUrl, { bypass = false } = {}) {
+  let current = new URL(initialUrl);
+  if (bypass) {
+    current.searchParams.set("__cache_verifier", Date.now() + "-" + randomUUID().slice(0, 8));
+  }
+
+  for (let redirects = 0; redirects <= MAX_REDIRECTS; redirects += 1) {
+    await validateRemoteUrl(current.href);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const startedAt = performance.now();
+    let response;
+    try {
+      response = await fetch(current, {
+        redirect: "manual",
+        signal: controller.signal,
+        headers: {
+          Accept: "*/*",
+          "User-Agent": "CacheVerifier/1.0 (+server-side diagnostic)",
+          ...(bypass ? { "Cache-Control": "no-cache", Pragma: "no-cache" } : {})
+        }
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+    const latencyMs = Math.round(performance.now() - startedAt);
+
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get("location");
+      if (!location) throw new Error("Redirect response did not include a Location header");
+      if (redirects === MAX_REDIRECTS) throw new Error("Too many redirects");
+      current = new URL(location, current);
+      continue;
+    }
+
+    const { buffer, truncated } = await readRemoteBody(response);
+    const contentType = response.headers.get("content-type") || "";
+    const isText = /(?:text\/|json|javascript|xml|svg)/i.test(contentType);
+    return {
+      requestedUrl: initialUrl,
+      finalUrl: current.href,
+      status: response.status,
+      ok: response.ok,
+      latencyMs,
+      contentType,
+      sizeBytes: buffer.byteLength,
+      truncated,
+      hash: createHash("sha256").update(buffer).digest("hex"),
+      text: isText ? buffer.toString("utf8") : "",
+      headers: headersToObject(response.headers)
+    };
+  }
+  throw new Error("Too many redirects");
+}
+
+export function discoverAssets(html, pageUrl, limit = MAX_DISCOVERED_ASSETS) {
+  const assets = [];
+  const seen = new Set();
+  const pattern = /(?:src|href)\s*=\s*["']([^"'#]+)["']/gi;
+  let match;
+  while ((match = pattern.exec(html)) && assets.length < limit) {
+    try {
+      const url = new URL(match[1], pageUrl);
+      if (!["http:", "https:"].includes(url.protocol)) continue;
+      if (seen.has(url.href)) continue;
+      if (!/\.(?:css|js|mjs|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf)(?:\?|$)/i.test(url.pathname + url.search)) continue;
+      seen.add(url.href);
+      assets.push(url.href);
+    } catch {
+      // Ignore malformed asset references.
+    }
+  }
+  return assets;
+}
+
+function analyzePair(normal, bypass, expectedText, expectedEdge) {
+  const cacheState = classifyCache(normal.headers);
+  const ttl = calculateTtl(normal.headers);
+  const normalContains = expectedText ? normal.text.includes(expectedText) : null;
+  const bypassContains = expectedText ? bypass.text.includes(expectedText) : null;
+  const sameContent = normal.hash === bypass.hash;
+  const edgeValues = [
+    normal.headers.via,
+    normal.headers.server,
+    normal.headers["x-cache"],
+    normal.headers["cf-ray"],
+    normal.headers["x-served-by"]
+  ].filter(Boolean).join(" ");
+  const edgeMatched = expectedEdge ? edgeValues.toLowerCase().includes(expectedEdge.toLowerCase()) : null;
+
+  let verdict = "consistent";
+  let rationale = "The regular and cache-bypassed probes returned the same content hash.";
+  if (!normal.ok) {
+    verdict = "error";
+    rationale = "The target returned HTTP " + normal.status + ".";
+  } else if (!bypass.ok) {
+    verdict = "unverifiable";
+    rationale = "The regular response succeeded, but the cache-bypassed probe returned HTTP " + bypass.status + ". The URL may be signed or reject query parameters.";
+  } else if (expectedText && normalContains) {
+    verdict = "current";
+    rationale = "The regular response contains the expected newest-content marker.";
+  } else if (expectedText && !normalContains && bypassContains) {
+    verdict = "stale";
+    rationale = "The marker is missing from the regular response but present in the cache-bypassed response.";
+  } else if (expectedText && !normalContains && !bypassContains) {
+    verdict = "marker-missing";
+    rationale = "The expected marker is missing from both probes; confirm the new content is deployed.";
+  } else if (!sameContent) {
+    verdict = "different";
+    rationale = "Regular and cache-bypassed content differs. This can indicate stale cache or a dynamic page.";
+  } else if (normal.truncated || bypass.truncated) {
+    verdict = "limited";
+    rationale = "The response exceeded 4 MiB; the comparison covers only the captured prefix.";
+  } else if (cacheState === "UNKNOWN") {
+    verdict = "unverifiable";
+    rationale = "Content is consistent, but no recognized CDN cache header was exposed.";
+  }
+
+  return {
+    cacheState,
+    ttl,
+    sameContent,
+    expectedText: expectedText || "",
+    expectedTextFound: normalContains,
+    bypassExpectedTextFound: bypassContains,
+    expectedEdge: expectedEdge || "",
+    edgeMatched,
+    verdict,
+    rationale
+  };
+}
+
+async function inspectTarget(target, expectedEdge, kind = "page") {
+  const normal = await fetchWithValidatedRedirects(target.url);
+  const bypass = await fetchWithValidatedRedirects(target.url, { bypass: true });
+  return {
+    kind,
+    url: target.url,
+    finalUrl: normal.finalUrl,
+    status: normal.status,
+    bypassStatus: bypass.status,
+    latencyMs: normal.latencyMs,
+    contentType: normal.contentType,
+    sizeBytes: normal.sizeBytes,
+    truncated: normal.truncated,
+    hash: normal.hash,
+    bypassHash: bypass.hash,
+    headers: normal.headers,
+    ...analyzePair(normal, bypass, target.expectedText, expectedEdge),
+    discoveredAssets: kind === "page" && /text\/html/i.test(normal.contentType)
+      ? discoverAssets(normal.text, normal.finalUrl)
+      : []
+  };
+}
+
+function normalizeTargets(body) {
+  if (!Array.isArray(body.targets) || body.targets.length === 0) {
+    throw new Error("Add at least one page path or URL");
+  }
+  if (body.targets.length > MAX_TARGETS) throw new Error("A maximum of " + MAX_TARGETS + " page targets is allowed");
+
+  let baseUrl = null;
+  if (body.baseUrl) {
+    try {
+      baseUrl = new URL(body.baseUrl);
+    } catch {
+      throw new Error("Base website URL is invalid");
+    }
+  }
+
+  return body.targets.map((target) => {
+    const value = typeof target === "string" ? target : target?.value;
+    const expectedText = typeof target === "object" ? String(target.expectedText || "").slice(0, 300) : "";
+    if (!value || typeof value !== "string") throw new Error("Every target needs a URL or page path");
+    let url;
+    try {
+      url = baseUrl ? new URL(value, baseUrl) : new URL(value);
+    } catch {
+      throw new Error("Invalid target: " + value);
+    }
+    return { url: url.href, expectedText };
+  });
+}
+
+function allowedByRateLimit(request) {
+  const key = request.socket.remoteAddress || "unknown";
+  const now = Date.now();
+  const current = rateLimits.get(key);
+  if (!current || now - current.startedAt >= RATE_LIMIT_WINDOW_MS) {
+    rateLimits.set(key, { startedAt: now, count: 1 });
+    return true;
+  }
+  current.count += 1;
+  return current.count <= RATE_LIMIT_REQUESTS;
+}
+
+async function handleVerification(request, response) {
+  if (!allowedByRateLimit(request)) {
+    sendJson(response, 429, { error: "Too many checks. Wait one minute and try again." });
+    return;
+  }
+  try {
+    const body = await readJson(request);
+    const targets = normalizeTargets(body);
+    const expectedEdge = String(body.expectedEdge || "").trim().slice(0, 100);
+    const results = [];
+    const warnings = [];
+
+    for (const target of targets) {
+      try {
+        results.push(await inspectTarget(target, expectedEdge));
+      } catch (error) {
+        results.push({
+          kind: "page",
+          url: target.url,
+          verdict: "error",
+          rationale: error.name === "AbortError" ? "Request timed out after 15 seconds." : error.message
+        });
+      }
+    }
+
+    if (body.discoverAssets) {
+      const discovered = [];
+      const seen = new Set(targets.map(({ url }) => url));
+      for (const result of results) {
+        for (const url of result.discoveredAssets || []) {
+          if (!seen.has(url) && discovered.length < MAX_DISCOVERED_ASSETS) {
+            seen.add(url);
+            discovered.push({ url, expectedText: "" });
+          }
+        }
+      }
+      for (const asset of discovered) {
+        try {
+          results.push(await inspectTarget(asset, expectedEdge, "asset"));
+        } catch (error) {
+          results.push({ kind: "asset", url: asset.url, verdict: "error", rationale: error.message });
+        }
+      }
+      if (discovered.length === MAX_DISCOVERED_ASSETS) {
+        warnings.push("Asset discovery is limited to " + MAX_DISCOVERED_ASSETS + " resources per run.");
+      }
+    }
+
+    sendJson(response, 200, {
+      checkedAt: new Date().toISOString(),
+      results,
+      warnings,
+      note: "A cache HIT is not automatically stale. Use an expected-content marker for the strongest result."
+    });
+  } catch (error) {
+    sendJson(response, 400, { error: error.message });
+  }
+}
+
+async function serveStatic(request, response, pathname) {
+  const relativePath = pathname === "/" ? "/index.html" : pathname;
+  let decodedPath;
+  try {
+    decodedPath = decodeURIComponent(relativePath);
+  } catch {
+    sendJson(response, 400, { error: "Invalid URL" });
+    return;
+  }
+  const filePath = path.resolve(PUBLIC_DIR, "." + decodedPath);
+  if (filePath !== PUBLIC_DIR && !filePath.startsWith(PUBLIC_DIR + path.sep)) {
+    sendJson(response, 403, { error: "Forbidden" });
+    return;
+  }
+  try {
+    const file = await stat(filePath);
+    if (!file.isFile()) throw new Error("Not a file");
+    response.writeHead(200, {
+      "Content-Type": MIME_TYPES[path.extname(filePath).toLowerCase()] || "application/octet-stream",
+      "Content-Length": file.size,
+      "Cache-Control": path.extname(filePath) === ".html" ? "no-cache" : "public, max-age=3600"
+    });
+    if (request.method === "HEAD") response.end();
+    else createReadStream(filePath).pipe(response);
+  } catch {
+    sendJson(response, 404, { error: "Not found" });
+  }
+}
+
+export async function requestHandler(request, response) {
+  response.setHeader("X-Content-Type-Options", "nosniff");
+  response.setHeader("X-Frame-Options", "DENY");
+  response.setHeader("Referrer-Policy", "no-referrer");
+  response.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
+  response.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'");
+
+  const url = new URL(request.url, "http://localhost");
+  if (request.method === "GET" && ["/healthz", "/readyz"].includes(url.pathname)) {
+    sendJson(response, 200, { status: "ok", service: "cache-verifier" });
+    return;
+  }
+  if (request.method === "GET" && url.pathname === "/api/meta") {
+    sendJson(response, 200, {
+      name: "Cache Verifier",
+      version: "1.0.0",
+      maxTargets: MAX_TARGETS,
+      maxDiscoveredAssets: MAX_DISCOVERED_ASSETS
+    });
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/api/check") {
+    await handleVerification(request, response);
+    return;
+  }
+  if (request.method === "GET" || request.method === "HEAD") {
+    await serveStatic(request, response, url.pathname);
+    return;
+  }
+  sendJson(response, 405, { error: "Method not allowed" });
+}
+
+export function startServer(port = Number(process.env.PORT || 3000)) {
+  const server = createServer((request, response) => {
+    requestHandler(request, response).catch((error) => {
+      console.error("Request failed:", error);
+      if (!response.headersSent) sendJson(response, 500, { error: "Internal server error" });
+      else response.end();
+    });
+  });
+  server.listen(port, "0.0.0.0", () => {
+    console.log("Cache Verifier listening on 0.0.0.0:" + server.address().port);
+  });
+  return server;
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const server = startServer();
+  const shutdown = () => server.close(() => process.exit(0));
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
+}
