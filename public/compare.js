@@ -8,9 +8,18 @@ const releaseId = document.querySelector("#release-id");
 const updatedAt = document.querySelector("#updated-at");
 const pathsInput = document.querySelector("#paths");
 const normalizeHtml = document.querySelector("#normalize-html");
-const discoverAssets = document.querySelector("#discover-assets");
+const comparisonMode = document.querySelector("#comparison-mode");
+const probeTimeout = document.querySelector("#probe-timeout");
+const assetLimit = document.querySelector("#asset-limit");
+const batchSize = document.querySelector("#batch-size");
+const modeHelp = document.querySelector("#mode-help");
 const sampleButton = document.querySelector("#sample-button");
 const runButton = document.querySelector("#run-button");
+const cancelButton = document.querySelector("#cancel-button");
+const progressPanel = document.querySelector("#progress-panel");
+const progressLabel = document.querySelector("#progress-label");
+const progressCount = document.querySelector("#progress-count");
+const progressBar = document.querySelector("#progress-bar");
 const pathCount = document.querySelector("#path-count");
 const resultsRoot = document.querySelector("#results");
 const empty = document.querySelector("#empty");
@@ -21,6 +30,8 @@ const jsonButton = document.querySelector("#json-button");
 const toast = document.querySelector("#toast");
 let lastReport = null;
 let toastTimer;
+let cancelRequested = false;
+let activeBatchController = null;
 
 function showToast(message) {
   toast.textContent = message;
@@ -46,7 +57,21 @@ function updateCount() {
 function setLoading(value) {
   runButton.disabled = value;
   sampleButton.disabled = value;
-  runButton.textContent = value ? "Comparing environments…" : "▶ Run environment comparison";
+  comparisonMode.disabled = value;
+  probeTimeout.disabled = value;
+  assetLimit.disabled = value;
+  batchSize.disabled = value;
+  cancelButton.disabled = !value;
+  progressPanel.classList.toggle("hidden", !value);
+  runButton.textContent = value ? "Comparing in safe batches…" : "▶ Run environment comparison";
+}
+
+function setProgress(label, percentage) {
+  const value = Math.max(0, Math.min(100, Math.round(percentage)));
+  progressLabel.textContent = label;
+  progressCount.textContent = value + "%";
+  progressBar.value = value;
+  progressBar.textContent = value + "%";
 }
 
 function formatBytes(value) {
@@ -223,6 +248,166 @@ sampleButton.addEventListener("click", () => {
   showToast("Example loaded. Replace the URLs with your staging and production environments.");
 });
 
+function splitIntoBatches(targets, size) {
+  const batches = [];
+  for (let index = 0; index < targets.length; index += size) batches.push(targets.slice(index, index + size));
+  return batches;
+}
+
+function summarize(results) {
+  return {
+    total: results.length,
+    current: results.filter((item) => item.comparison.severity === "good").length,
+    cdnStale: results.filter((item) => item.comparison.code === "cdn-stale").length,
+    review: results.filter((item) => item.comparison.severity === "warn").length,
+    errors: results.filter((item) => item.comparison.severity === "error").length
+  };
+}
+
+function failureResults(targets, environments, kind, message) {
+  return targets.map((target) => ({
+    path: target.value,
+    kind,
+    expectedText: target.expectedText || "",
+    comparison: { code: "error", label: "Batch failed", severity: "error", confidence: "high", rationale: message },
+    snapshots: environments.map((environment) => {
+      let url = target.value;
+      try { url = new URL(target.value, environment.baseUrl).href; } catch { /* Keep the supplied path. */ }
+      return {
+        environment: environment.key,
+        label: environment.label,
+        kind,
+        url,
+        verdict: "error",
+        confidence: "high",
+        errorType: "batch",
+        rationale: message,
+        headers: {},
+        release: { releaseId: "", builtAt: "", source: "" }
+      };
+    })
+  }));
+}
+
+function createReport(base, state) {
+  return {
+    profileName: base.profileName || "Environment comparison",
+    checkedAt: new Date().toISOString(),
+    environments: base.environments,
+    options: {
+      normalizeHtml: base.normalizeHtml,
+      expectedReleaseId: base.expectedReleaseId,
+      contentUpdatedAt: base.contentUpdatedAt,
+      comparisonMode: base.comparisonMode,
+      timeoutMs: base.timeoutMs,
+      retryCount: 1,
+      targetConcurrency: 2,
+      batchDeadlineMs: 40_000,
+      assetDiscoveryLimit: base.assetDiscoveryLimit
+    },
+    summary: summarize(state.results),
+    warnings: [...state.warnings],
+    results: [...state.results],
+    note: state.cancelled
+      ? "The run was cancelled. Completed batches and their evidence were preserved."
+      : "Results are requested in short batches so a slow target does not discard completed evidence."
+  };
+}
+
+async function requestBatch(body) {
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (cancelRequested) throw new DOMException("Comparison cancelled", "AbortError");
+    const controller = new AbortController();
+    activeBatchController = controller;
+    let clientTimedOut = false;
+    const timer = setTimeout(() => {
+      clientTimedOut = true;
+      controller.abort();
+    }, 45_000);
+    try {
+      const response = await fetch("/api/compare-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify(body)
+      });
+      const text = await response.text();
+      let payload = {};
+      try { payload = JSON.parse(text || "{}"); } catch { payload = {}; }
+      if (response.ok) return payload;
+      const error = new Error(payload.error || "Comparison batch failed with HTTP " + response.status);
+      error.status = response.status;
+      throw error;
+    } catch (error) {
+      if (cancelRequested) throw error;
+      lastError = clientTimedOut ? new Error("Comparison batch exceeded the 45-second client deadline") : error;
+      const transient = clientTimedOut || error.name === "TypeError" || [502, 503, 504].includes(error.status);
+      if (!transient || attempt === 1) throw lastError;
+      await new Promise((resolve) => setTimeout(resolve, 350 + Math.floor(Math.random() * 250)));
+    } finally {
+      clearTimeout(timer);
+      if (activeBatchController === controller) activeBatchController = null;
+    }
+  }
+  throw lastError;
+}
+
+async function runPhase(targets, kind, base, state, startPercent, percentRange) {
+  const batches = splitIntoBatches(targets, base.batchSize);
+  for (let index = 0; index < batches.length; index += 1) {
+    if (cancelRequested) {
+      state.cancelled = true;
+      break;
+    }
+    const batch = batches[index];
+    setProgress((kind === "page" ? "Pages" : "Assets") + " · batch " + (index + 1) + " of " + batches.length, startPercent + (index / batches.length) * percentRange);
+    try {
+      const payload = await requestBatch({
+        ...base,
+        targets: batch,
+        targetKind: kind,
+        discoverAssets: kind === "page" && base.assetDiscoveryLimit > 0,
+        targetConcurrency: Math.min(2, batch.length),
+        retryCount: 1,
+        batchDeadlineMs: 40_000
+      });
+      state.results.push(...(payload.results || []));
+      for (const warning of payload.warnings || []) state.warnings.add(warning);
+      for (const asset of payload.discoveredAssets || []) {
+        if (state.discoveredAssets.length >= base.assetDiscoveryLimit) break;
+        if (!state.seenPaths.has(asset)) {
+          state.seenPaths.add(asset);
+          state.discoveredAssets.push({ value: asset, expectedText: "" });
+        }
+      }
+    } catch (error) {
+      if (cancelRequested) {
+        state.cancelled = true;
+        break;
+      }
+      const message = error.message || "Comparison batch failed";
+      state.results.push(...failureResults(batch, base.environments, kind, message));
+      state.warnings.add((kind === "page" ? "Page" : "Asset") + " batch " + (index + 1) + " failed after one retry: " + message);
+    }
+    render(createReport(base, state));
+    setProgress((kind === "page" ? "Pages" : "Assets") + " · batch " + (index + 1) + " of " + batches.length, startPercent + ((index + 1) / batches.length) * percentRange);
+  }
+}
+
+comparisonMode.addEventListener("change", () => {
+  modeHelp.textContent = comparisonMode.value === "deep"
+    ? "Deep mode runs normal and cache-bypass probes for every environment. It is slower and should use small batches."
+    : "Quick mode bypasses cache only for the production CDN, reducing outbound requests by one third.";
+});
+
+cancelButton.addEventListener("click", () => {
+  cancelRequested = true;
+  activeBatchController?.abort();
+  cancelButton.disabled = true;
+  progressLabel.textContent = "Cancelling after completed work is saved…";
+});
+
 pathsInput.addEventListener("input", updateCount);
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -248,27 +433,40 @@ form.addEventListener("submit", async (event) => {
     });
   }
 
+  const selectedAssetLimit = Number(assetLimit.value);
+  const base = {
+    profileName: profileName.value.trim(),
+    environments,
+    expectedReleaseId: releaseId.value.trim(),
+    contentUpdatedAt: updatedAt.value ? new Date(updatedAt.value).toISOString() : "",
+    normalizeHtml: normalizeHtml.checked,
+    comparisonMode: comparisonMode.value,
+    timeoutMs: Number(probeTimeout.value),
+    assetDiscoveryLimit: selectedAssetLimit,
+    batchSize: Number(batchSize.value)
+  };
+  const state = {
+    results: [],
+    warnings: new Set(),
+    discoveredAssets: [],
+    seenPaths: new Set(targets.map((target) => target.value)),
+    cancelled: false
+  };
+
+  cancelRequested = false;
   setLoading(true);
+  setProgress("Preparing page batches…", 0);
   notice.classList.add("hidden");
-  summaryText.textContent = "Running normal and bypass probes across all configured environments…";
+  summaryText.textContent = "Running short comparison batches; completed evidence will appear below.";
   try {
-    const response = await fetch("/api/compare", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        profileName: profileName.value.trim(),
-        environments,
-        targets,
-        expectedReleaseId: releaseId.value.trim(),
-        contentUpdatedAt: updatedAt.value ? new Date(updatedAt.value).toISOString() : "",
-        normalizeHtml: normalizeHtml.checked,
-        discoverAssets: discoverAssets.checked
-      })
-    });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Comparison failed");
-    render(payload);
-    showToast("Environment comparison complete.");
+    await runPhase(targets, "page", base, state, 0, selectedAssetLimit > 0 ? 70 : 100);
+    if (!cancelRequested && state.discoveredAssets.length) {
+      await runPhase(state.discoveredAssets, "asset", base, state, 70, 30);
+    }
+    if (!state.results.length) throw new Error(cancelRequested ? "Comparison cancelled before a batch completed." : "No comparison result was returned.");
+    render(createReport(base, state));
+    setProgress(state.cancelled ? "Comparison cancelled" : "Comparison complete", state.cancelled ? progressBar.value : 100);
+    showToast(state.cancelled ? "Comparison cancelled; completed results were kept." : "Environment comparison complete.");
   } catch (error) {
     summaryText.textContent = "Comparison did not complete.";
     notice.textContent = error.message;

@@ -130,6 +130,20 @@ test("serves health and UI endpoints", async () => {
   const meta = await fetch("http://127.0.0.1:" + port + "/api/meta");
   assert.equal(meta.status, 200);
   const metadata = await meta.json();
-  assert.equal(metadata.version, "2.0.0");
+  assert.equal(metadata.version, "2.1.0");
   assert.ok(metadata.features.includes("environment-comparison"));
+  assert.ok(metadata.features.includes("batched-comparison"));
+  assert.equal(metadata.maxBatchTargets, 3);
+});
+
+test("rejects oversized comparison batches before outbound requests", async () => {
+  await new Promise((resolve) => server.listening ? resolve() : server.once("listening", resolve));
+  const port = server.address().port;
+  const response = await fetch("http://127.0.0.1:" + port + "/api/compare-batch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ targets: [{}, {}, {}, {}] })
+  });
+  assert.equal(response.status, 400);
+  assert.match((await response.json()).error, /between 1 and 3 targets/);
 });

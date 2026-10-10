@@ -6,7 +6,29 @@ A deployable web service for locating content-recency differences between:
 2. The production static host or a selected public IP
 3. The public production CDN seen by visitors
 
-The browser calls its own Node.js backend, so cache and Varnish headers can be inspected without browser CORS restrictions. The original single-target API remains available at POST /api/check; the primary UI now uses POST /api/compare.
+The browser calls its own Node.js backend, so cache and Varnish headers can be inspected without browser CORS restrictions. The UI uses short calls to `POST /api/compare-batch`, preserving completed evidence instead of keeping one long request open until every page finishes.
+
+## Avoiding gateway timeouts
+
+Version 2.1 is designed for platforms with an ingress or gateway request deadline:
+
+- The browser sends only 1–3 paths per API request; the default is 2.
+- Completed batches render immediately and remain available if a later batch fails.
+- Each remote probe is adjustable from 3 to 12 seconds in the UI; the default is 8 seconds.
+- A server-side batch has a 40-second deadline and cannot be configured above 45 seconds.
+- Temporary DNS, connection, timeout, `502`, `503`, and `504` failures receive one retry with jitter.
+- At most two target paths run concurrently by default.
+- HTTP and HTTPS keep-alive connections reduce repeated TCP and TLS setup.
+- Asset discovery runs after page comparison as a separate phase and defaults to three assets.
+- The **Cancel remaining batches** button keeps results that have already completed.
+
+Do not solve a `504 Gateway Time-out` by selecting a longer probe timeout. A longer timeout can keep the upstream request open until the platform gateway stops waiting. Use the 8-second default, two paths per batch, and Quick mode first.
+
+### Quick and Deep modes
+
+**Quick (recommended)** sends one normal request to staging and the production host, then normal and cache-bypass requests to the production CDN. With three environments, this reduces each target from six outbound requests to four.
+
+**Deep cache check** sends normal and cache-bypass requests to every configured environment. Use it for detailed cache investigation with one or two paths per batch, not as the default for a large site scan.
 
 ## Recommended BiznetGio workflow
 
@@ -29,7 +51,7 @@ Then add paths such as:
 /images/logo.svg
 ~~~
 
-The tool runs normal and cache-bypassed probes against every configured source. It compares release IDs, expected text, static-file hashes, normalized HTML, cache timing, and Varnish evidence.
+The tool compares release IDs, expected text, static-file hashes, normalized HTML, cache timing, and Varnish evidence. Quick mode runs cache bypass only against the production CDN; Deep mode runs it against every source.
 
 Root-cause results include:
 
@@ -183,9 +205,11 @@ After deployment:
 3. Enter staging and production CDN URLs.
 4. Add the production static-host URL and optional public IP.
 5. Add page and static-asset paths.
-6. Enter an expected release ID, expected page marker, or update time when available.
-7. Run the comparison.
-8. Export CSV for a flat evidence table or JSON for the complete report.
+6. Keep **Quick**, **8 seconds**, **3 assets**, and **2 paths per batch** for the first run.
+7. Enter an expected release ID, expected page marker, or update time when available.
+8. Run the comparison. Results appear after each batch instead of waiting for the entire scan.
+9. Use Deep mode only when you need bypass evidence from staging and the production host too.
+10. Export CSV for a flat evidence table or JSON for the complete report.
 
 ## Safety and operational limits
 
@@ -194,7 +218,9 @@ After deployment:
 - Forced IPs must be public IPv4 or IPv6 addresses.
 - Redirect destinations are validated again; cross-host redirects are rejected during forced-IP checks.
 - The hostname is preserved for Host routing and TLS SNI, and TLS verification cannot be disabled.
-- Each remote probe has a 15-second timeout.
+- Each remote probe has a configurable 3–15-second server limit; the UI offers 3, 5, 8, or 12 seconds and defaults to 8.
+- Each UI request contains at most 3 targets and has a 40-second server deadline.
+- One transient retry is allowed; deterministic `4xx`, TLS, validation, and private-network errors are not retried.
 - At most 20 page targets and 10 discovered assets are checked per run.
 - Response capture is limited to 4 MiB per probe.
 - The API is rate-limited per caller.
@@ -206,9 +232,11 @@ Deploy this service only for websites you are authorized to test. Each run creat
 
 The check runs from the NEO App service location. It can inspect the edge selected for that location, but it cannot prove the state of every CDN point of presence worldwide. Multi-region verification would require runners in multiple geographic regions.
 
-## Comparison API
+## Batched comparison API
 
-**POST /api/compare**
+**POST /api/compare-batch**
+
+The browser uses this endpoint. Send no more than three targets per request and aggregate the returned `results`. When `discoverAssets` is enabled, `discoveredAssets` contains paths for a later asset batch; assets are not processed inside the page request.
 
 ~~~json
 {
@@ -238,7 +266,14 @@ The check runs from the NEO App service location. It can inspect the edge select
   "expectedReleaseId": "a8c31f2",
   "contentUpdatedAt": "2026-10-10T09:30:00.000Z",
   "normalizeHtml": true,
-  "discoverAssets": true
+  "discoverAssets": true,
+  "assetDiscoveryLimit": 3,
+  "comparisonMode": "quick",
+  "timeoutMs": 8000,
+  "retryCount": 1,
+  "targetConcurrency": 2,
+  "batchDeadlineMs": 40000,
+  "targetKind": "page"
 }
 ~~~
 
@@ -249,4 +284,5 @@ Other endpoints:
 - GET /healthz
 - GET /readyz
 - GET /api/meta
+- POST /api/compare for direct single-request API use; browser clients should prefer the batch endpoint
 - POST /api/check for the legacy single-target workflow

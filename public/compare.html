@@ -86,13 +86,54 @@
               <input id="normalize-html" type="checkbox" checked>
               <span><strong>Normalize HTML</strong><small>Ignore origin names, comments, CSP nonces, request IDs, and spacing before hashing.</small></span>
             </label>
-            <label class="toggle" for="discover-assets">
-              <input id="discover-assets" type="checkbox" checked>
-              <span><strong>Discover static assets</strong><small>Compare up to 10 same-origin CSS, JS, image, and font resources from staging pages.</small></span>
-            </label>
           </div>
 
+          <fieldset class="execution-settings">
+            <legend>Request safety and speed</legend>
+            <div class="settings-grid">
+              <div>
+                <label for="comparison-mode">Comparison mode</label>
+                <select id="comparison-mode">
+                  <option value="quick" selected>Quick (recommended)</option>
+                  <option value="deep">Deep cache check</option>
+                </select>
+              </div>
+              <div>
+                <label for="probe-timeout">Probe timeout</label>
+                <select id="probe-timeout">
+                  <option value="3000">3 seconds</option>
+                  <option value="5000">5 seconds</option>
+                  <option value="8000" selected>8 seconds</option>
+                  <option value="12000">12 seconds</option>
+                </select>
+              </div>
+              <div>
+                <label for="asset-limit">Discover assets</label>
+                <select id="asset-limit">
+                  <option value="0">Off</option>
+                  <option value="3" selected>Up to 3</option>
+                  <option value="5">Up to 5</option>
+                  <option value="10">Up to 10</option>
+                </select>
+              </div>
+              <div>
+                <label for="batch-size">Paths per batch</label>
+                <select id="batch-size">
+                  <option value="1">1 path</option>
+                  <option value="2" selected>2 paths</option>
+                  <option value="3">3 paths</option>
+                </select>
+              </div>
+            </div>
+            <p class="help" id="mode-help">Quick mode bypasses cache only for the production CDN, reducing outbound requests by one third.</p>
+          </fieldset>
+
           <button id="run-button" class="button primary" type="submit"><span>▶</span> Run environment comparison</button>
+          <div id="progress-panel" class="progress-panel hidden" aria-live="polite">
+            <div class="progress-copy"><strong id="progress-label">Preparing comparison…</strong><span id="progress-count">0%</span></div>
+            <progress id="progress-bar" max="100" value="0">0%</progress>
+            <button id="cancel-button" class="button subtle" type="button">Cancel remaining batches</button>
+          </div>
           <p class="safety">Only public HTTP(S) endpoints on ports 80 and 443 are allowed. TLS verification stays enabled.</p>
         </form>
 

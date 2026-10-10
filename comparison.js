@@ -1,15 +1,22 @@
 import { createHash, randomUUID } from "node:crypto";
 import dns from "node:dns/promises";
-import { request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
+import { Agent as HttpAgent, request as httpRequest } from "node:http";
+import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import net from "node:net";
 
 const MAX_REMOTE_BYTES = 4 * 1024 * 1024;
 const MAX_PATHS = 20;
 const MAX_DISCOVERED_ASSETS = 10;
-const REQUEST_TIMEOUT_MS = 15_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 8_000;
+const MIN_REQUEST_TIMEOUT_MS = 3_000;
+const MAX_REQUEST_TIMEOUT_MS = 15_000;
+const DEFAULT_BATCH_DEADLINE_MS = 40_000;
+const MAX_BATCH_DEADLINE_MS = 45_000;
+const MAX_TARGET_CONCURRENCY = 3;
 const MAX_REDIRECTS = 5;
+const TRANSIENT_STATUS_CODES = new Set([502, 503, 504]);
 const ALLOWED_ENVIRONMENT_KEYS = new Set(["staging", "productionCdn", "productionHost"]);
+const connectionAgents = new Map();
 const OBSERVED_HEADERS = [
   "age", "cache-control", "cdn-cache-control", "cf-cache-status", "cf-ray", "date",
   "etag", "expires", "last-modified", "server", "surrogate-control", "via", "warning",
@@ -116,13 +123,30 @@ function fixedLookup(address, family) {
   };
 }
 
-async function requestOnce(url, pinned, bypass) {
+function getConnectionAgent(url, pinned) {
+  const key = [url.protocol, url.hostname, url.port || (url.protocol === "https:" ? "443" : "80"), pinned.address].join("|");
+  if (!connectionAgents.has(key)) {
+    const AgentClass = url.protocol === "https:" ? HttpsAgent : HttpAgent;
+    connectionAgents.set(key, new AgentClass({ keepAlive: true, maxSockets: 6, maxFreeSockets: 2, timeout: 20_000 }));
+  }
+  return connectionAgents.get(key);
+}
+
+function isTransientError(error) {
+  return error?.name === "AbortError" || ["ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "ENETUNREACH", "ETIMEDOUT"].includes(error?.code);
+}
+
+function waitForRetry(attempt) {
+  return new Promise((resolve) => setTimeout(resolve, 150 + attempt * 125 + Math.floor(Math.random() * 100)));
+}
+
+async function requestOnce(url, pinned, bypass, timeoutMs) {
   const startedAt = performance.now();
   const requestHeaders = {
     Accept: "*/*",
     "Accept-Encoding": "identity",
     Host: url.host,
-    "User-Agent": "CacheVerifier/2.0 (+multi-environment diagnostic)"
+    "User-Agent": "CacheVerifier/2.1 (+batched multi-environment diagnostic)"
   };
   if (bypass) {
     requestHeaders["Cache-Control"] = "no-cache";
@@ -137,7 +161,7 @@ async function requestOnce(url, pinned, bypass) {
     path: url.pathname + url.search,
     method: "GET",
     headers: requestHeaders,
-    agent: false,
+    agent: getConnectionAgent(url, pinned),
     lookup: fixedLookup(pinned.address, pinned.family)
   };
   if (isTls) {
@@ -151,13 +175,14 @@ async function requestOnce(url, pinned, bypass) {
       let size = 0;
       let truncated = false;
       let finished = false;
+      const responseSocket = response.socket;
       const finish = () => {
         if (finished) return;
         finished = true;
         const buffer = Buffer.concat(chunks);
         const contentType = String(response.headers["content-type"] || "");
         const isText = /(?:text\/|json|javascript|xml|svg)/i.test(contentType);
-        const socket = response.socket;
+        const socket = responseSocket;
         let tls = null;
         if (isTls) {
           const certificate = typeof socket.getPeerCertificate === "function" ? socket.getPeerCertificate() : {};
@@ -204,8 +229,8 @@ async function requestOnce(url, pinned, bypass) {
       response.on("end", finish);
       response.on("error", (error) => truncated ? finish() : reject(error));
     });
-    request.setTimeout(REQUEST_TIMEOUT_MS, () => {
-      const error = new Error("Request timed out after 15 seconds");
+    request.setTimeout(timeoutMs, () => {
+      const error = new Error("Request timed out after " + Math.round(timeoutMs / 1000) + " seconds");
       error.name = "AbortError";
       request.destroy(error);
     });
@@ -214,7 +239,7 @@ async function requestOnce(url, pinned, bypass) {
   });
 }
 
-async function fetchPinned(initialUrl, overrideIp, bypass = false) {
+async function fetchPinned(initialUrl, overrideIp, { bypass = false, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, retryCount = 1, deadlineAt = 0 } = {}) {
   const original = new URL(initialUrl);
   let current = new URL(initialUrl);
   if (bypass) current.searchParams.set("__cache_verifier", Date.now() + "-" + randomUUID().slice(0, 8));
@@ -232,7 +257,22 @@ async function fetchPinned(initialUrl, overrideIp, bypass = false) {
       pinned = { address: resolved.address, family: resolved.family };
     }
 
-    const response = await requestOnce(current, pinned, bypass);
+    let response;
+    for (let attempt = 0; attempt <= retryCount; attempt += 1) {
+      const remainingMs = deadlineAt ? deadlineAt - Date.now() : timeoutMs;
+      if (remainingMs <= 250) {
+        const error = new Error("Batch deadline reached before this probe completed");
+        error.name = "DeadlineError";
+        throw error;
+      }
+      try {
+        response = await requestOnce(current, pinned, bypass, Math.min(timeoutMs, remainingMs));
+        if (!TRANSIENT_STATUS_CODES.has(response.status) || attempt === retryCount) break;
+      } catch (error) {
+        if (!isTransientError(error) || attempt === retryCount) throw error;
+      }
+      await waitForRetry(attempt);
+    }
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       if (!response.location) throw new Error("Redirect response did not include a Location header");
       if (redirects === MAX_REDIRECTS) throw new Error("Too many redirects");
@@ -380,16 +420,16 @@ function recencyForSnapshot(normal, bypass, options) {
   const delivery = varnish.detected && varnish.delivery !== "UNKNOWN" ? varnish.delivery : cacheState;
   const estimatedCachedAt = estimateCacheTime(normal.headers);
   const normalContains = expectedText ? normal.text.includes(expectedText) : null;
-  const bypassContains = expectedText ? bypass.text.includes(expectedText) : null;
+  const bypassContains = expectedText && bypass ? bypass.text.includes(expectedText) : null;
   const normalRelease = extractReleaseInfo(normal.text, normal.contentType, normal.headers);
-  const bypassRelease = extractReleaseInfo(bypass.text, bypass.contentType, bypass.headers);
+  const bypassRelease = bypass ? extractReleaseInfo(bypass.text, bypass.contentType, bypass.headers) : { releaseId: "", builtAt: "", source: "" };
   let verdict = "consistent";
   let confidence = "low";
-  let rationale = "Normal and cache-bypassed response hashes match.";
+  let rationale = bypass ? "Normal and cache-bypassed response hashes match." : "The normal response completed; bypass was skipped in Quick mode.";
 
   if (!normal.ok) {
     verdict = "error"; confidence = "high"; rationale = "The endpoint returned HTTP " + normal.status + ".";
-  } else if (!bypass.ok) {
+  } else if (bypass && !bypass.ok) {
     verdict = "unverifiable"; rationale = "The bypass probe returned HTTP " + bypass.status + ".";
   } else if (expectedReleaseId && normalRelease.releaseId === expectedReleaseId) {
     verdict = "current"; confidence = "high"; rationale = "The expected release ID is present in the normal response.";
@@ -405,9 +445,9 @@ function recencyForSnapshot(normal, bypass, options) {
     verdict = "possible-stale"; confidence = "medium"; rationale = "Estimated cache time predates the supplied update time.";
   } else if (delivery === "GRACE") {
     verdict = "grace"; confidence = "medium"; rationale = "An expired object appears to be served within Varnish grace.";
-  } else if (normal.hash !== bypass.hash) {
+  } else if (bypass && normal.hash !== bypass.hash) {
     verdict = "different"; rationale = "Normal and cache-bypassed content differs.";
-  } else if (normal.truncated || bypass.truncated) {
+  } else if (normal.truncated || bypass?.truncated) {
     verdict = "limited"; rationale = "The comparison covers only the first 4 MiB.";
   }
 
@@ -426,10 +466,18 @@ function recencyForSnapshot(normal, bypass, options) {
   };
 }
 
+export function shouldBypassEnvironment(environmentKey, comparisonMode = "quick") {
+  return comparisonMode === "deep" || environmentKey === "productionCdn";
+}
+
 async function inspectEnvironment(environment, target, options, kind) {
   const url = new URL(target.value, environment.baseUrl).href;
-  const normal = await fetchPinned(url, environment.overrideIp, false);
-  const bypass = await fetchPinned(url, environment.overrideIp, true);
+  const fetchOptions = { timeoutMs: options.timeoutMs, retryCount: options.retryCount, deadlineAt: options.deadlineAt };
+  const normal = await fetchPinned(url, environment.overrideIp, fetchOptions);
+  const bypassPerformed = shouldBypassEnvironment(environment.key, options.comparisonMode);
+  const bypass = bypassPerformed
+    ? await fetchPinned(url, environment.overrideIp, { ...fetchOptions, bypass: true })
+    : null;
   const recency = recencyForSnapshot(normal, bypass, {
     expectedText: target.expectedText,
     expectedReleaseId: options.expectedReleaseId,
@@ -448,14 +496,15 @@ async function inspectEnvironment(environment, target, options, kind) {
     url,
     finalUrl: normal.finalUrl,
     status: normal.status,
-    bypassStatus: bypass.status,
+    bypassPerformed,
+    bypassStatus: bypass?.status ?? null,
     latencyMs: normal.latencyMs,
     contentType: normal.contentType,
     sizeBytes: normal.sizeBytes,
     truncated: normal.truncated,
     hash: normal.hash,
     normalizedHash,
-    bypassHash: bypass.hash,
+    bypassHash: bypass?.hash || "",
     connectedIp: normal.connectedIp,
     requestedHost: normal.requestedHost,
     overrideIp: normal.overrideIp,
@@ -574,6 +623,52 @@ function cleanSnapshot(snapshot) {
   return clean;
 }
 
+function clampInteger(value, fallback, minimum, maximum) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
+}
+
+export function normalizeRuntimeOptions(body = {}) {
+  return {
+    comparisonMode: body.comparisonMode === "deep" ? "deep" : "quick",
+    timeoutMs: clampInteger(body.timeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, MIN_REQUEST_TIMEOUT_MS, MAX_REQUEST_TIMEOUT_MS),
+    retryCount: clampInteger(body.retryCount, 1, 0, 1),
+    targetConcurrency: clampInteger(body.targetConcurrency, 2, 1, MAX_TARGET_CONCURRENCY),
+    batchDeadlineMs: clampInteger(body.batchDeadlineMs, DEFAULT_BATCH_DEADLINE_MS, 10_000, MAX_BATCH_DEADLINE_MS),
+    assetDiscoveryLimit: clampInteger(body.assetDiscoveryLimit, 3, 0, MAX_DISCOVERED_ASSETS)
+  };
+}
+
+function errorSnapshot(environment, target, kind, error) {
+  const timedOut = error?.name === "AbortError" || error?.name === "DeadlineError";
+  return {
+    environment: environment.key,
+    label: environment.label,
+    kind,
+    url: new URL(target.value, environment.baseUrl).href,
+    verdict: "error",
+    confidence: "high",
+    errorType: timedOut ? "timeout" : "request",
+    rationale: timedOut ? error.message : (error?.message || "Request failed"),
+    release: { releaseId: "", builtAt: "", source: "" },
+    headers: {}
+  };
+}
+
+async function mapWithConcurrency(items, concurrency, worker) {
+  const output = new Array(items.length);
+  let nextIndex = 0;
+  async function runWorker() {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      output[index] = await worker(items[index], index);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, runWorker));
+  return output;
+}
+
 export async function runComparison(body) {
   const environments = Array.isArray(body.environments) ? body.environments.filter((item) => item?.baseUrl).map(normalizeEnvironment) : [];
   if (!environments.some((item) => item.key === "staging")) throw new Error("Staging base URL is required");
@@ -589,57 +684,51 @@ export async function runComparison(body) {
     if (!Number.isFinite(parsed)) throw new Error("Content update time is invalid");
     contentUpdatedAt = new Date(parsed).toISOString();
   }
+  const runtime = normalizeRuntimeOptions(body);
   const options = {
     normalizeHtml: body.normalizeHtml !== false,
     expectedReleaseId: String(body.expectedReleaseId || "").trim().slice(0, 160),
-    contentUpdatedAt
+    contentUpdatedAt,
+    ...runtime,
+    deadlineAt: Date.now() + runtime.batchDeadlineMs
   };
   const warnings = [];
-  const results = [];
-  const seenPaths = new Set(targets.map((target) => target.value));
+  const discoveredAssets = [];
+  const seenAssets = new Set(targets.map((target) => target.value));
+  const requestedKind = body.targetKind === "asset" ? "asset" : "page";
 
-  for (let index = 0; index < targets.length; index += 1) {
-    const target = targets[index];
-    const kind = index >= (body.targets?.length || 0) ? "asset" : "page";
+  const results = await mapWithConcurrency(targets, runtime.targetConcurrency, async (target) => {
+    const kind = requestedKind;
     const snapshots = await Promise.all(environments.map(async (environment) => {
       try {
         return await inspectEnvironment(environment, target, options, kind);
       } catch (error) {
-        return {
-          environment: environment.key,
-          label: environment.label,
-          kind,
-          url: new URL(target.value, environment.baseUrl).href,
-          verdict: "error",
-          confidence: "high",
-          rationale: error.name === "AbortError" ? "Request timed out after 15 seconds." : error.message,
-          release: { releaseId: "", builtAt: "", source: "" },
-          headers: {}
-        };
+        return errorSnapshot(environment, target, kind, error);
       }
     }));
     const comparison = compareEnvironmentSnapshots(snapshots, target, options);
-    results.push({
+    const result = {
       path: target.value,
       kind,
       expectedText: target.expectedText,
       comparison,
       snapshots: snapshots.map(cleanSnapshot)
-    });
+    };
 
     if (body.discoverAssets && kind === "page") {
       const staging = snapshots.find((item) => item.environment === "staging");
       for (const asset of staging?._assets || []) {
-        if (seenPaths.size >= MAX_PATHS + MAX_DISCOVERED_ASSETS) break;
-        if (!seenPaths.has(asset)) {
-          seenPaths.add(asset);
-          targets.push({ value: asset, expectedText: "" });
+        if (discoveredAssets.length >= runtime.assetDiscoveryLimit) break;
+        if (!seenAssets.has(asset)) {
+          seenAssets.add(asset);
+          discoveredAssets.push(asset);
         }
       }
     }
-  }
+    return result;
+  });
 
-  if (targets.length > MAX_PATHS) warnings.push("Asset discovery added up to " + MAX_DISCOVERED_ASSETS + " same-origin static resources.");
+  if (discoveredAssets.length) warnings.push("Discovered " + discoveredAssets.length + " same-origin static resource(s) for the browser to check in a separate batch.");
   if (environments.some((item) => item.overrideIp)) {
     warnings.push("Forced-IP checks preserve the URL hostname for Host routing and TLS SNI; TLS certificate verification remains enabled.");
   }
@@ -654,9 +743,10 @@ export async function runComparison(body) {
     profileName: String(body.profileName || "Environment comparison").slice(0, 100),
     checkedAt: new Date().toISOString(),
     environments,
-    options,
+    options: { ...options, deadlineAt: undefined },
     summary,
     warnings,
+    discoveredAssets,
     results,
     note: "A matching release ID or expected marker is stronger evidence than cache headers or hashes alone."
   };

@@ -17,7 +17,8 @@ const MAX_DISCOVERED_ASSETS = 10;
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_REDIRECTS = 5;
 const RATE_LIMIT_WINDOW_MS = 60_000;
-const RATE_LIMIT_REQUESTS = 15;
+const RATE_LIMIT_REQUESTS = 30;
+const MAX_BATCH_TARGETS = 3;
 const rateLimits = new Map();
 
 const MIME_TYPES = {
@@ -595,10 +596,11 @@ export async function requestHandler(request, response) {
   if (request.method === "GET" && url.pathname === "/api/meta") {
     sendJson(response, 200, {
       name: "Cache Verifier",
-      version: "2.0.0",
+      version: "2.1.0",
       maxTargets: MAX_TARGETS,
       maxDiscoveredAssets: MAX_DISCOVERED_ASSETS,
-      features: ["environment-comparison", "forced-public-ip", "release-detection", "varnish-recency"]
+      maxBatchTargets: MAX_BATCH_TARGETS,
+      features: ["environment-comparison", "batched-comparison", "partial-results", "forced-public-ip", "release-detection", "varnish-recency"]
     });
     return;
   }
@@ -613,6 +615,22 @@ export async function requestHandler(request, response) {
     }
     try {
       const body = await readJson(request);
+      sendJson(response, 200, await runComparison(body));
+    } catch (error) {
+      sendJson(response, 400, { error: error.message });
+    }
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/api/compare-batch") {
+    if (!allowedByRateLimit(request)) {
+      sendJson(response, 429, { error: "Too many comparison batches. Wait one minute and try again." });
+      return;
+    }
+    try {
+      const body = await readJson(request);
+      if (!Array.isArray(body.targets) || body.targets.length > MAX_BATCH_TARGETS) {
+        throw new Error("Each batch must contain between 1 and " + MAX_BATCH_TARGETS + " targets");
+      }
       sendJson(response, 200, await runComparison(body));
     } catch (error) {
       sendJson(response, 400, { error: error.message });

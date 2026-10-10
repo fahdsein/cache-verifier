@@ -4,7 +4,9 @@ import {
   compareEnvironmentSnapshots,
   extractReleaseInfo,
   isBlockedAddress,
-  normalizeHtmlContent
+  normalizeHtmlContent,
+  normalizeRuntimeOptions,
+  shouldBypassEnvironment
 } from "../comparison.js";
 
 function snapshot(environment, overrides = {}) {
@@ -79,4 +81,37 @@ test("uses normalized hashes when no release marker exists", () => {
   ], { expectedText: "" }, { expectedReleaseId: "", normalizeHtml: true });
   assert.equal(result.code, "cdn-stale");
   assert.equal(result.confidence, "medium");
+});
+
+test("uses safe runtime defaults and clamps user-controlled limits", () => {
+  assert.deepEqual(normalizeRuntimeOptions({}), {
+    comparisonMode: "quick",
+    timeoutMs: 8000,
+    retryCount: 1,
+    targetConcurrency: 2,
+    batchDeadlineMs: 40000,
+    assetDiscoveryLimit: 3
+  });
+  assert.deepEqual(normalizeRuntimeOptions({
+    comparisonMode: "deep",
+    timeoutMs: 99999,
+    retryCount: 9,
+    targetConcurrency: 12,
+    batchDeadlineMs: 99999,
+    assetDiscoveryLimit: 99
+  }), {
+    comparisonMode: "deep",
+    timeoutMs: 15000,
+    retryCount: 1,
+    targetConcurrency: 3,
+    batchDeadlineMs: 45000,
+    assetDiscoveryLimit: 10
+  });
+});
+
+test("quick mode bypasses only the public production CDN", () => {
+  assert.equal(shouldBypassEnvironment("staging", "quick"), false);
+  assert.equal(shouldBypassEnvironment("productionHost", "quick"), false);
+  assert.equal(shouldBypassEnvironment("productionCdn", "quick"), true);
+  assert.equal(shouldBypassEnvironment("staging", "deep"), true);
 });
