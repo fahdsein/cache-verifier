@@ -65,7 +65,11 @@
 
           <label for="expected-edge">Expected CDN / edge identifier <span class="optional">Optional</span></label>
           <input id="expected-edge" name="expectedEdge" type="text" maxlength="100" placeholder="cloudflare, cloudfront, varnish">
-          <p class="field-help">Matched against Via, Server, X-Cache, CF-Ray, and X-Served-By.</p>
+          <p class="field-help">Matched against Via, Server, X-Cache, X-Varnish, CF-Ray, and X-Served-By.</p>
+
+          <label for="content-updated-at">Content last updated <span class="optional">Optional</span></label>
+          <input id="content-updated-at" name="contentUpdatedAt" type="datetime-local">
+          <p class="field-help">Uses response Date minus Age to estimate whether a cached object predates your update. Your local time is converted to UTC.</p>
 
           <label class="toggle-row" for="discover-assets">
             <input id="discover-assets" name="discoverAssets" type="checkbox" checked>
@@ -114,11 +118,12 @@
               <h3>A cache HIT does not mean stale</h3>
             </div>
             <div class="guide-grid">
-              <p><span class="legend current"></span><strong>Current:</strong> expected newest text exists in the normal response.</p>
-              <p><span class="legend stale"></span><strong>Stale:</strong> expected text exists only in the bypassed response.</p>
-              <p><span class="legend review"></span><strong>Review:</strong> hashes differ, the marker is absent, or headers cannot prove freshness.</p>
-              <p><span class="legend consistent"></span><strong>Consistent:</strong> both probes have the same hash, but no marker was supplied.</p>
+              <p><span class="legend current"></span><strong>Current:</strong> expected newest text is present, or the estimated cache time follows the supplied update time.</p>
+              <p><span class="legend stale"></span><strong>Stale:</strong> the newest marker appears only after bypass, or a Varnish hit appears older than the supplied update time.</p>
+              <p><span class="legend review"></span><strong>Review:</strong> Varnish grace, changed hashes, missing markers, or insufficient headers require investigation.</p>
+              <p><span class="legend consistent"></span><strong>Consistent:</strong> both probes match, but consistency alone cannot prove newest content.</p>
             </div>
+            <p class="guide-note">Varnish X-Varnish transaction-ID counts are shown as low-confidence hints only. Explicit X-Cache values and content markers are stronger evidence.</p>
           </section>
         </div>
       </section>

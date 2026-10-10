@@ -2,6 +2,7 @@ const form = document.querySelector("#check-form");
 const baseUrlInput = document.querySelector("#base-url");
 const targetList = document.querySelector("#target-list");
 const expectedEdgeInput = document.querySelector("#expected-edge");
+const contentUpdatedAtInput = document.querySelector("#content-updated-at");
 const discoverAssetsInput = document.querySelector("#discover-assets");
 const runButton = document.querySelector("#run-button");
 const sampleButton = document.querySelector("#sample-button");
@@ -17,8 +18,11 @@ let toastTimer;
 
 const verdictLabels = {
   current: "Current",
+  "likely-current": "Likely current",
   consistent: "Consistent",
   stale: "Stale",
+  "possible-stale": "Possibly stale",
+  grace: "Grace",
   different: "Review",
   "marker-missing": "Marker missing",
   unverifiable: "Unverifiable",
@@ -75,6 +79,12 @@ function formatTtl(result) {
   return age + "s / " + result.ttl.remainingSeconds + "s left";
 }
 
+function formatDate(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "—" : date.toLocaleString();
+}
+
 function appendMetric(parent, label, value) {
   const metric = document.createElement("div");
   metric.className = "metric";
@@ -108,7 +118,7 @@ function createResultCard(result) {
   main.className = "result-main";
   const kind = document.createElement("span");
   kind.className = "kind-pill";
-  kind.textContent = result.kind || "page";
+  kind.textContent = (result.kind || "page") + (result.varnish?.detected ? " · varnish" : "");
 
   const urlBox = document.createElement("div");
   urlBox.className = "result-url";
@@ -130,7 +140,7 @@ function createResultCard(result) {
   const metrics = document.createElement("div");
   metrics.className = "result-metrics";
   appendMetric(metrics, "HTTP", Number.isFinite(result.status) ? String(result.status) : "—");
-  appendMetric(metrics, "Cache", result.cacheState || "—");
+  appendMetric(metrics, "Delivery", result.delivery || result.cacheState || "—");
   appendMetric(metrics, "Age / TTL", formatTtl(result));
   appendMetric(metrics, "Latency", Number.isFinite(result.latencyMs) ? result.latencyMs + " ms" : "—");
   appendMetric(metrics, "Captured", formatBytes(result.sizeBytes));
@@ -143,6 +153,13 @@ function createResultCard(result) {
   appendDetail(grid, "Final URL", result.finalUrl);
   appendDetail(grid, "Bypass HTTP", result.bypassStatus);
   appendDetail(grid, "Content type", result.contentType);
+  appendDetail(grid, "Recency confidence", result.confidence);
+  appendDetail(grid, "Generic cache classification", result.cacheState);
+  appendDetail(grid, "Varnish detected", result.varnish?.detected === undefined ? "" : String(result.varnish.detected));
+  appendDetail(grid, "Varnish delivery evidence", result.varnish?.evidence);
+  appendDetail(grid, "X-Varnish transaction IDs", result.varnish?.transactionIds?.join(" "));
+  appendDetail(grid, "Estimated cached at", result.estimatedCachedAt ? formatDate(result.estimatedCachedAt) : "");
+  appendDetail(grid, "Content updated at", result.contentUpdatedAt ? formatDate(result.contentUpdatedAt) : "");
   appendDetail(grid, "Normal SHA-256", result.hash);
   appendDetail(grid, "Bypass SHA-256", result.bypassHash);
   appendDetail(grid, "Hashes match", result.sameContent === null || result.sameContent === undefined ? "" : String(result.sameContent));
@@ -156,7 +173,7 @@ function createResultCard(result) {
 }
 
 function updateStats(results) {
-  const good = results.filter((item) => ["current", "consistent"].includes(item.verdict)).length;
+  const good = results.filter((item) => ["current", "likely-current", "consistent"].includes(item.verdict)).length;
   const errors = results.filter((item) => item.verdict === "error").length;
   document.querySelector("#stat-total").textContent = String(results.length);
   document.querySelector("#stat-good").textContent = String(good);
@@ -186,10 +203,11 @@ function csvCell(value) {
 function exportCsv() {
   if (!lastResults.length) return;
   const columns = [
-    "kind", "url", "finalUrl", "status", "bypassStatus", "verdict", "rationale", "cacheState",
+    "kind", "url", "finalUrl", "status", "bypassStatus", "verdict", "confidence", "rationale", "cacheState", "delivery",
     "ageSeconds", "maxAgeSeconds", "remainingSeconds", "latencyMs", "sizeBytes",
-    "sameContent", "expectedTextFound", "edgeMatched", "etag", "last-modified",
-    "cache-control", "cf-cache-status", "x-cache", "via", "server", "hash", "bypassHash"
+    "estimatedCachedAt", "contentUpdatedAt", "sameContent", "expectedTextFound", "edgeMatched",
+    "varnishDetected", "varnishConfidence", "varnishEvidence", "x-varnish", "etag", "last-modified",
+    "date", "age", "cache-control", "cf-cache-status", "x-cache", "via", "server", "warning", "hash", "bypassHash"
   ];
   const rows = lastResults.map((item) => {
     const flat = {
@@ -197,6 +215,9 @@ function exportCsv() {
       ageSeconds: item.ttl?.ageSeconds,
       maxAgeSeconds: item.ttl?.maxAgeSeconds,
       remainingSeconds: item.ttl?.remainingSeconds,
+      varnishDetected: item.varnish?.detected,
+      varnishConfidence: item.varnish?.confidence,
+      varnishEvidence: item.varnish?.evidence,
       ...item.headers
     };
     return columns.map((column) => csvCell(flat[column])).join(",");
@@ -218,6 +239,7 @@ sampleButton.addEventListener("click", () => {
   baseUrlInput.value = "https://example.com";
   targetList.value = "/ || Example Domain\n/";
   expectedEdgeInput.value = "";
+  contentUpdatedAtInput.value = "";
   discoverAssetsInput.checked = true;
   updateTargetCount();
   showToast("Example loaded. Replace it with your public website when ready.");
@@ -251,6 +273,7 @@ form.addEventListener("submit", async (event) => {
         baseUrl: baseUrlInput.value.trim(),
         targets,
         expectedEdge: expectedEdgeInput.value.trim(),
+        contentUpdatedAt: contentUpdatedAtInput.value ? new Date(contentUpdatedAtInput.value).toISOString() : "",
         discoverAssets: discoverAssetsInput.checked
       })
     });

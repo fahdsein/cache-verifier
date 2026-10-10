@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Compare staging, production host, and production CDN content recency.">
+    <title>Environment Cache Comparator</title>
+    <link rel="stylesheet" href="/compare.css">
+    <script src="/compare.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">CV</span>
+        <div>
+          <span class="kicker">BiznetGio release verification</span>
+          <h1>Environment Cache Comparator</h1>
+        </div>
+      </div>
+      <span class="server-badge"><i></i> Server-side comparison</span>
+    </header>
+
+    <main>
+      <section class="intro">
+        <div>
+          <span class="kicker accent">Trace content from release to visitor</span>
+          <h2>Find where an update becomes outdated.</h2>
+          <p>Compare staging, the production static host, and the public production CDN for every page and discovered static asset.</p>
+        </div>
+        <div class="flow" aria-label="Comparison flow">
+          <span>Staging</span><b>→</b><span>Production host</span><b>→</b><span>Production CDN</span>
+        </div>
+      </section>
+
+      <section class="layout">
+        <form id="compare-form" class="panel form-panel">
+          <div class="panel-head">
+            <div><span class="kicker">Comparison profile</span><h3>Sources and release</h3></div>
+            <button id="sample-button" class="button subtle" type="button">Load example</button>
+          </div>
+
+          <label for="profile-name">Comparison name</label>
+          <input id="profile-name" type="text" maxlength="100" value="BiznetGio staging vs production">
+
+          <fieldset>
+            <legend><span class="source-index">1</span> Staging candidate</legend>
+            <label for="staging-url">Staging base URL</label>
+            <input id="staging-url" type="url" required placeholder="https://staging.example.com">
+          </fieldset>
+
+          <fieldset>
+            <legend><span class="source-index">2</span> Production CDN</legend>
+            <label for="production-url">Public production URL</label>
+            <input id="production-url" type="url" required placeholder="https://www.example.com">
+          </fieldset>
+
+          <fieldset>
+            <legend><span class="source-index">3</span> Production static host <em>Recommended</em></legend>
+            <label for="host-url">Production hostname / base URL <span class="optional">Optional</span></label>
+            <input id="host-url" type="url" placeholder="https://www.example.com">
+            <label for="host-ip">Force connection to public IP <span class="optional">Optional</span></label>
+            <input id="host-ip" type="text" inputmode="decimal" placeholder="203.0.113.10">
+            <p class="help">Use the production hostname above and the static-host IP here. The request preserves Host routing and TLS SNI.</p>
+          </fieldset>
+
+          <div class="two-column">
+            <div>
+              <label for="release-id">Expected release ID <span class="optional">Optional</span></label>
+              <input id="release-id" type="text" maxlength="160" placeholder="git SHA or build ID">
+            </div>
+            <div>
+              <label for="updated-at">Content updated at <span class="optional">Optional</span></label>
+              <input id="updated-at" type="datetime-local">
+            </div>
+          </div>
+
+          <div class="label-row">
+            <label for="paths">Pages and assets</label>
+            <span id="path-count">0 / 20</span>
+          </div>
+          <textarea id="paths" rows="8" required placeholder="/&#10;/pricing || Latest pricing headline&#10;/version.json&#10;/assets/app.css"></textarea>
+          <p class="help">One path per line. Add <code>|| newest text marker</code> when a page has a known update.</p>
+
+          <div class="toggles">
+            <label class="toggle" for="normalize-html">
+              <input id="normalize-html" type="checkbox" checked>
+              <span><strong>Normalize HTML</strong><small>Ignore origin names, comments, CSP nonces, request IDs, and spacing before hashing.</small></span>
+            </label>
+            <label class="toggle" for="discover-assets">
+              <input id="discover-assets" type="checkbox" checked>
+              <span><strong>Discover static assets</strong><small>Compare up to 10 same-origin CSS, JS, image, and font resources from staging pages.</small></span>
+            </label>
+          </div>
+
+          <button id="run-button" class="button primary" type="submit"><span>▶</span> Run environment comparison</button>
+          <p class="safety">Only public HTTP(S) endpoints on ports 80 and 443 are allowed. TLS verification stays enabled.</p>
+        </form>
+
+        <section class="output">
+          <div class="stats" aria-label="Comparison summary">
+            <article><span>Paths checked</span><strong id="stat-total">0</strong></article>
+            <article class="good"><span>Current / aligned</span><strong id="stat-current">0</strong></article>
+            <article class="bad"><span>CDN stale</span><strong id="stat-stale">0</strong></article>
+            <article class="warn"><span>Review / errors</span><strong id="stat-review">0</strong></article>
+          </div>
+
+          <section class="panel result-panel">
+            <div class="panel-head">
+              <div><span class="kicker">Evidence</span><h3>Environment comparison</h3><p id="summary-text">No comparison has run yet.</p></div>
+              <div class="actions">
+                <button id="csv-button" class="button subtle" type="button" disabled>CSV</button>
+                <button id="json-button" class="button subtle" type="button" disabled>JSON</button>
+              </div>
+            </div>
+            <div id="notice" class="notice hidden" role="status"></div>
+            <div id="empty" class="empty"><span>⇄</span><strong>Ready to compare</strong><p>Add the environment URLs and paths, then run the check.</p></div>
+            <div id="results" class="results hidden" aria-live="polite"></div>
+          </section>
+
+          <section class="panel guide">
+            <span class="kicker">Root-cause guide</span>
+            <h3>How conclusions are made</h3>
+            <div class="guide-grid">
+              <p><i class="dot good"></i><strong>All aligned:</strong> staging, production host, and CDN match.</p>
+              <p><i class="dot bad"></i><strong>CDN stale:</strong> production host has the new release, but CDN does not.</p>
+              <p><i class="dot warn"></i><strong>Not deployed:</strong> staging is new, but the production host is still old.</p>
+              <p><i class="dot neutral"></i><strong>Production differs:</strong> host and CDN agree but intentionally or unexpectedly differ from staging.</p>
+            </div>
+            <p class="guide-note">Release IDs and expected markers are strongest. Static-file hashes are strong. Normalized HTML and cache headers are supporting evidence.</p>
+          </section>
+        </section>
+      </section>
+    </main>
+    <div id="toast" class="toast" role="alert"></div>
+  </body>
+</html>

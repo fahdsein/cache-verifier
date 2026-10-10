@@ -6,6 +6,7 @@ import { createServer } from "node:http";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { runComparison } from "./comparison.js";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(ROOT, "public");
@@ -35,16 +36,20 @@ const OBSERVED_HEADERS = [
   "cdn-cache-control",
   "cf-cache-status",
   "cf-ray",
+  "date",
   "etag",
   "expires",
   "last-modified",
   "server",
   "surrogate-control",
   "via",
+  "warning",
   "x-cache",
+  "x-cacheable",
   "x-cache-hits",
   "x-cdn",
   "x-served-by",
+  "x-varnish",
   "x-vercel-cache"
 ];
 
@@ -151,7 +156,7 @@ export function classifyCache(headers) {
     headers["cdn-cache-control"]
   ].filter(Boolean).join(" ").toUpperCase();
 
-  for (const state of ["STALE", "REVALIDATED", "EXPIRED", "BYPASS", "DYNAMIC", "MISS", "HIT"]) {
+  for (const state of ["GRACE", "STALE", "REVALIDATED", "EXPIRED", "BYPASS", "PASS", "PIPE", "DYNAMIC", "MISS", "HIT"]) {
     if (signal.includes(state)) return state;
   }
   return Number(headers.age || 0) > 0 ? "HIT (inferred)" : "UNKNOWN";
@@ -167,6 +172,69 @@ export function calculateTtl(headers) {
     maxAgeSeconds: maxAge,
     remainingSeconds: maxAge === null ? null : Math.max(0, maxAge - (Number.isFinite(age) ? age : 0))
   };
+}
+
+export function detectVarnish(headers) {
+  const via = String(headers.via || "");
+  const server = String(headers.server || "");
+  const xVarnish = String(headers["x-varnish"] || "").trim();
+  const xCache = String(headers["x-cache"] || "").trim();
+  const detected = Boolean(xVarnish || /varnish/i.test(via) || /varnish/i.test(server));
+  const transactionIds = (xVarnish.match(/\d+/g) || []).slice(0, 8);
+  const cacheSignal = xCache.toLowerCase();
+  let delivery = "UNKNOWN";
+  let confidence = "none";
+  let evidence = detected ? "Varnish signature found, but no explicit delivery result was exposed." : "No Varnish signature was exposed.";
+
+  if (/hit\s+graced|grace/.test(cacheSignal)) {
+    delivery = "GRACE";
+    confidence = "high";
+    evidence = "X-Cache reports a graced hit.";
+  } else if (/\bhit\b/.test(cacheSignal)) {
+    delivery = "HIT";
+    confidence = "high";
+    evidence = "X-Cache explicitly reports a cache hit.";
+  } else if (/\bmiss\b/.test(cacheSignal)) {
+    delivery = "MISS";
+    confidence = "high";
+    evidence = "X-Cache explicitly reports a cache miss.";
+  } else if (/\bpass\b/.test(cacheSignal)) {
+    delivery = "PASS";
+    confidence = "high";
+    evidence = "X-Cache explicitly reports a cache pass.";
+  } else if (/\bpipe\b/.test(cacheSignal)) {
+    delivery = "PIPE";
+    confidence = "high";
+    evidence = "X-Cache explicitly reports a piped request.";
+  } else if (detected && transactionIds.length >= 2) {
+    delivery = "LIKELY HIT";
+    confidence = "low";
+    evidence = "X-Varnish contains multiple transaction IDs. This is a convention, not a guaranteed modern Varnish rule.";
+  } else if (detected && transactionIds.length === 1) {
+    delivery = "LIKELY MISS";
+    confidence = "low";
+    evidence = "X-Varnish contains one transaction ID. This is a convention, not definitive proof of a miss.";
+  } else if (detected && Number(headers.age || 0) > 0) {
+    delivery = "LIKELY HIT";
+    confidence = "low";
+    evidence = "A positive Age value suggests cached delivery, but it does not prove content staleness.";
+  }
+
+  return {
+    detected,
+    delivery,
+    confidence,
+    evidence,
+    transactionIds
+  };
+}
+
+export function estimateCacheTime(headers) {
+  if (!headers.date || headers.age === undefined) return null;
+  const responseTime = Date.parse(headers.date);
+  const ageSeconds = Number(headers.age);
+  if (!Number.isFinite(responseTime) || !Number.isFinite(ageSeconds) || ageSeconds < 0) return null;
+  return new Date(responseTime - ageSeconds * 1000).toISOString();
 }
 
 async function readRemoteBody(response) {
@@ -267,9 +335,12 @@ export function discoverAssets(html, pageUrl, limit = MAX_DISCOVERED_ASSETS) {
   return assets;
 }
 
-function analyzePair(normal, bypass, expectedText, expectedEdge) {
+export function analyzePair(normal, bypass, expectedText, expectedEdge, contentUpdatedAt) {
   const cacheState = classifyCache(normal.headers);
   const ttl = calculateTtl(normal.headers);
+  const varnish = detectVarnish(normal.headers);
+  const delivery = varnish.detected && varnish.delivery !== "UNKNOWN" ? varnish.delivery : cacheState;
+  const estimatedCachedAt = estimateCacheTime(normal.headers);
   const normalContains = expectedText ? normal.text.includes(expectedText) : null;
   const bypassContains = expectedText ? bypass.text.includes(expectedText) : null;
   const sameContent = normal.hash === bypass.hash;
@@ -277,42 +348,68 @@ function analyzePair(normal, bypass, expectedText, expectedEdge) {
     normal.headers.via,
     normal.headers.server,
     normal.headers["x-cache"],
+    normal.headers["x-varnish"],
     normal.headers["cf-ray"],
     normal.headers["x-served-by"]
   ].filter(Boolean).join(" ");
   const edgeMatched = expectedEdge ? edgeValues.toLowerCase().includes(expectedEdge.toLowerCase()) : null;
 
   let verdict = "consistent";
+  let confidence = "low";
   let rationale = "The regular and cache-bypassed probes returned the same content hash.";
   if (!normal.ok) {
     verdict = "error";
+    confidence = "high";
     rationale = "The target returned HTTP " + normal.status + ".";
   } else if (!bypass.ok) {
     verdict = "unverifiable";
+    confidence = "low";
     rationale = "The regular response succeeded, but the cache-bypassed probe returned HTTP " + bypass.status + ". The URL may be signed or reject query parameters.";
   } else if (expectedText && normalContains) {
     verdict = "current";
+    confidence = "high";
     rationale = "The regular response contains the expected newest-content marker.";
   } else if (expectedText && !normalContains && bypassContains) {
     verdict = "stale";
+    confidence = "high";
     rationale = "The marker is missing from the regular response but present in the cache-bypassed response.";
   } else if (expectedText && !normalContains && !bypassContains) {
     verdict = "marker-missing";
+    confidence = "medium";
     rationale = "The expected marker is missing from both probes; confirm the new content is deployed.";
+  } else if (contentUpdatedAt && estimatedCachedAt && Date.parse(estimatedCachedAt) < Date.parse(contentUpdatedAt) && /HIT|GRACE/.test(delivery)) {
+    verdict = "possible-stale";
+    confidence = "medium";
+    rationale = "The estimated cached-object time predates the supplied content-update time and the response appears to be a cache hit.";
+  } else if (contentUpdatedAt && estimatedCachedAt && Date.parse(estimatedCachedAt) >= Date.parse(contentUpdatedAt)) {
+    verdict = "likely-current";
+    confidence = "medium";
+    rationale = "The estimated cached-object time is at or after the supplied content-update time.";
+  } else if (delivery === "GRACE") {
+    verdict = "grace";
+    confidence = "medium";
+    rationale = "Varnish appears to be serving an expired object within its grace period while refresh may occur in the background.";
   } else if (!sameContent) {
     verdict = "different";
+    confidence = "low";
     rationale = "Regular and cache-bypassed content differs. This can indicate stale cache or a dynamic page.";
   } else if (normal.truncated || bypass.truncated) {
     verdict = "limited";
+    confidence = "low";
     rationale = "The response exceeded 4 MiB; the comparison covers only the captured prefix.";
   } else if (cacheState === "UNKNOWN") {
     verdict = "unverifiable";
+    confidence = "low";
     rationale = "Content is consistent, but no recognized CDN cache header was exposed.";
   }
 
   return {
     cacheState,
+    delivery,
     ttl,
+    varnish,
+    estimatedCachedAt,
+    contentUpdatedAt: contentUpdatedAt || "",
     sameContent,
     expectedText: expectedText || "",
     expectedTextFound: normalContains,
@@ -320,11 +417,12 @@ function analyzePair(normal, bypass, expectedText, expectedEdge) {
     expectedEdge: expectedEdge || "",
     edgeMatched,
     verdict,
+    confidence,
     rationale
   };
 }
 
-async function inspectTarget(target, expectedEdge, kind = "page") {
+async function inspectTarget(target, expectedEdge, contentUpdatedAt, kind = "page") {
   const normal = await fetchWithValidatedRedirects(target.url);
   const bypass = await fetchWithValidatedRedirects(target.url, { bypass: true });
   return {
@@ -340,7 +438,7 @@ async function inspectTarget(target, expectedEdge, kind = "page") {
     hash: normal.hash,
     bypassHash: bypass.hash,
     headers: normal.headers,
-    ...analyzePair(normal, bypass, target.expectedText, expectedEdge),
+    ...analyzePair(normal, bypass, target.expectedText, expectedEdge, contentUpdatedAt),
     discoveredAssets: kind === "page" && /text\/html/i.test(normal.contentType)
       ? discoverAssets(normal.text, normal.finalUrl)
       : []
@@ -397,12 +495,18 @@ async function handleVerification(request, response) {
     const body = await readJson(request);
     const targets = normalizeTargets(body);
     const expectedEdge = String(body.expectedEdge || "").trim().slice(0, 100);
+    let contentUpdatedAt = "";
+    if (body.contentUpdatedAt) {
+      const parsedUpdateTime = Date.parse(body.contentUpdatedAt);
+      if (!Number.isFinite(parsedUpdateTime)) throw new Error("Content update time is invalid");
+      contentUpdatedAt = new Date(parsedUpdateTime).toISOString();
+    }
     const results = [];
     const warnings = [];
 
     for (const target of targets) {
       try {
-        results.push(await inspectTarget(target, expectedEdge));
+        results.push(await inspectTarget(target, expectedEdge, contentUpdatedAt));
       } catch (error) {
         results.push({
           kind: "page",
@@ -426,7 +530,7 @@ async function handleVerification(request, response) {
       }
       for (const asset of discovered) {
         try {
-          results.push(await inspectTarget(asset, expectedEdge, "asset"));
+          results.push(await inspectTarget(asset, expectedEdge, contentUpdatedAt, "asset"));
         } catch (error) {
           results.push({ kind: "asset", url: asset.url, verdict: "error", rationale: error.message });
         }
@@ -440,7 +544,7 @@ async function handleVerification(request, response) {
       checkedAt: new Date().toISOString(),
       results,
       warnings,
-      note: "A cache HIT is not automatically stale. Use an expected-content marker for the strongest result."
+      note: "Delivery state and content recency are separate. A cache HIT is not automatically stale; an expected-content marker provides the strongest evidence."
     });
   } catch (error) {
     sendJson(response, 400, { error: error.message });
@@ -448,7 +552,7 @@ async function handleVerification(request, response) {
 }
 
 async function serveStatic(request, response, pathname) {
-  const relativePath = pathname === "/" ? "/index.html" : pathname;
+  const relativePath = pathname === "/" ? "/compare.html" : pathname;
   let decodedPath;
   try {
     decodedPath = decodeURIComponent(relativePath);
@@ -491,14 +595,28 @@ export async function requestHandler(request, response) {
   if (request.method === "GET" && url.pathname === "/api/meta") {
     sendJson(response, 200, {
       name: "Cache Verifier",
-      version: "1.0.0",
+      version: "2.0.0",
       maxTargets: MAX_TARGETS,
-      maxDiscoveredAssets: MAX_DISCOVERED_ASSETS
+      maxDiscoveredAssets: MAX_DISCOVERED_ASSETS,
+      features: ["environment-comparison", "forced-public-ip", "release-detection", "varnish-recency"]
     });
     return;
   }
   if (request.method === "POST" && url.pathname === "/api/check") {
     await handleVerification(request, response);
+    return;
+  }
+  if (request.method === "POST" && url.pathname === "/api/compare") {
+    if (!allowedByRateLimit(request)) {
+      sendJson(response, 429, { error: "Too many checks. Wait one minute and try again." });
+      return;
+    }
+    try {
+      const body = await readJson(request);
+      sendJson(response, 200, await runComparison(body));
+    } catch (error) {
+      sendJson(response, 400, { error: error.message });
+    }
     return;
   }
   if (request.method === "GET" || request.method === "HEAD") {

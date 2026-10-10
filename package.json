@@ -1,13 +1,13 @@
 {
   "name": "cache-verifier",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Server-side CDN cache and content freshness verifier for NEO App and other PaaS providers",
+  "description": "Multi-environment staging, production host, and CDN content-recency comparator",
   "type": "module",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "check": "node --check server.js && node --check public/app.js",
+    "check": "node --check server.js && node --check comparison.js && node --check public/app.js && node --check public/compare.js",
     "test": "node --test"
   },
   "engines": {
